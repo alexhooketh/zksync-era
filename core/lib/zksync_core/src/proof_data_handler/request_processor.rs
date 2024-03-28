@@ -9,9 +9,12 @@ use axum::{
 use zksync_config::configs::ProofDataHandlerConfig;
 use zksync_dal::{ConnectionPool, Core, CoreDal, SqlxError};
 use zksync_object_store::{ObjectStore, ObjectStoreError};
-use zksync_prover_interface::api::{
-    ProofGenerationData, ProofGenerationDataRequest, ProofGenerationDataResponse,
-    SubmitProofRequest, SubmitProofResponse,
+use zksync_prover_interface::{
+    api::{
+        ProofGenerationData, ProofGenerationDataRequest, ProofGenerationDataResponse,
+        SubmitProofRequest, SubmitProofResponse,
+    },
+    inputs::PrepareBasicCircuitsJob,
 };
 use zksync_types::{
     basic_fri_types::Eip4844Blobs, commitment::serialize_commitments, web3::signing::keccak256,
@@ -91,7 +94,7 @@ impl RequestProcessor {
             None => return Ok(Json(ProofGenerationDataResponse::Success(None))), // no batches pending to be proven
         };
 
-        let blob = self
+        let blob: PrepareBasicCircuitsJob = self
             .blob_store
             .get(l1_batch_number)
             .await

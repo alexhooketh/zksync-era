@@ -8388,6 +8388,7 @@ dependencies = [
  "zksync_consensus_storage",
  "zksync_consensus_utils",
  "zksync_contracts",
+ "zksync_crypto",
  "zksync_dal",
  "zksync_db_connection",
  "zksync_eth_client",

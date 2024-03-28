@@ -46,7 +46,7 @@ const FEE_ACCOUNT: Address = Address::repeat_byte(0x11);
 /// descriptions that are not only unique, but also will explain *why* we expected this action to happen. This way,
 /// it would be easier for developer to find the problem.
 ///
-/// See any test in the `mod.rs` file to get a visual example.
+/// See any test in the `tee_verifier_input_producer` file to get a visual example.
 pub(crate) struct TestScenario {
     actions: VecDeque<ScenarioItem>,
     pending_batch: Option<PendingBatchData>,
