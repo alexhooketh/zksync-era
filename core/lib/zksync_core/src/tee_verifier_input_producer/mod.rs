@@ -2,22 +2,28 @@ use std::{ops::Deref, sync::Arc, time::Instant};
 
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
-use multivm::interface::{L2BlockEnv, VmInterface};
+use multivm::{
+    interface::{FinishedL1Batch, L2BlockEnv, VmInterface},
+    vm_latest::HistoryEnabled,
+    VmInstance,
+};
 use tokio::{runtime::Handle, task::JoinHandle};
 use tracing::{debug, error, info, trace, warn};
 use vm_utils::{create_vm, execute_tx};
 use zksync_crypto::hasher::blake2::Blake2Hasher;
 use zksync_dal::{tee_verifier_input_producer_dal::JOB_MAX_ATTEMPT, ConnectionPool, Core, CoreDal};
+use zksync_db_connection::connection::Connection;
 use zksync_merkle_tree::{
     BlockOutputWithProofs, TreeInstruction, TreeLogEntry, TreeLogEntryWithProof,
 };
 use zksync_object_store::{ObjectStore, ObjectStoreFactory};
-use zksync_prover_interface::inputs::PrepareBasicCircuitsJob;
+use zksync_prover_interface::inputs::{PrepareBasicCircuitsJob, StorageLogMetadata};
 use zksync_queued_job_processor::JobProcessor;
+use zksync_state::WriteStorage;
 use zksync_types::{
     block::MiniblockExecutionData, ethabi::ethereum_types::BigEndianHash,
-    tee_verifier_input::TeeVerifierInput, AccountTreeId, L1BatchNumber, L2ChainId, StorageKey,
-    H256,
+    tee_verifier_input::TeeVerifierInput, zk_evm_types::LogQuery, AccountTreeId, L1BatchNumber,
+    L2ChainId, MiniblockNumber, StorageKey, H256,
 };
 
 use self::metrics::METRICS;
@@ -51,28 +57,41 @@ impl Deref for TeeBlockOutputWithProofs {
 impl From<PrepareBasicCircuitsJob> for TeeBlockOutputWithProofs {
     fn from(value: PrepareBasicCircuitsJob) -> Self {
         let merkle_paths = value.into_merkle_paths();
-        let mut logs: Vec<TreeLogEntryWithProof> = Vec::with_capacity(merkle_paths.len());
-        for path in merkle_paths {
-            let merkle_path = path.merkle_paths.iter().map(|x| x.into()).collect();
-            let base: TreeLogEntry =
-                match (path.is_write, path.first_write, path.leaf_enumeration_index) {
-                    (false, _, 0) => TreeLogEntry::ReadMissingKey,
-                    (false, _, _) => TreeLogEntry::Read {
-                        leaf_index: path.leaf_enumeration_index,
-                        value: path.value_read.into(),
-                    },
-                    (true, true, _) => TreeLogEntry::Inserted,
-                    (true, false, _) => TreeLogEntry::Updated {
-                        leaf_index: path.leaf_enumeration_index,
-                        previous_value: path.value_read.into(),
-                    },
-                };
-            logs.push(TreeLogEntryWithProof {
-                base,
-                merkle_path,
-                root_hash: path.root_hash.into(),
-            });
-        }
+        let logs = merkle_paths
+            .into_iter()
+            .map(
+                |StorageLogMetadata {
+                     root_hash,
+                     merkle_paths,
+                     is_write,
+                     first_write,
+                     leaf_enumeration_index,
+                     value_read,
+                     ..
+                 }| {
+                    let root_hash = root_hash.into();
+                    let merkle_path = merkle_paths.into_iter().map(|x| x.into()).collect();
+                    let base: TreeLogEntry = match (is_write, first_write, leaf_enumeration_index) {
+                        (false, _, 0) => TreeLogEntry::ReadMissingKey,
+                        (false, _, _) => TreeLogEntry::Read {
+                            leaf_index: leaf_enumeration_index,
+                            value: value_read.into(),
+                        },
+                        (true, true, _) => TreeLogEntry::Inserted,
+                        (true, false, _) => TreeLogEntry::Updated {
+                            leaf_index: leaf_enumeration_index,
+                            previous_value: value_read.into(),
+                        },
+                    };
+                    TreeLogEntryWithProof {
+                        base,
+                        merkle_path,
+                        root_hash,
+                    }
+                },
+            )
+            .collect();
+
         TeeBlockOutputWithProofs {
             inner: BlockOutputWithProofs {
                 logs,
@@ -107,7 +126,7 @@ impl TeeVerifierInputProducer {
             .block_on(object_store.get(l1_batch_number))
             .context("failed to get PrepareBasicCircuitsJob from object store")?;
 
-        let mut idx = job.next_enumeration_index();
+        let enumeration_index = job.next_enumeration_index();
         let bowp: TeeBlockOutputWithProofs = job.into();
 
         let mut connection = rt_handle
@@ -129,7 +148,6 @@ impl TeeVerifierInputProducer {
                     .get_l1_batch_state_root(l1_batch_number),
             )?
             .ok_or(anyhow!("Failed to get new root hash"))?;
-        //tracing::info!("{:?}", old_root_hash);
 
         let miniblocks_execution_data = rt_handle.block_on(
             connection
@@ -138,116 +156,20 @@ impl TeeVerifierInputProducer {
         )?;
 
         let fictive_miniblock_number = miniblocks_execution_data.last().unwrap().number + 1;
-        let fictive_miniblock_data = rt_handle
-            .block_on(
-                connection
-                    .sync_dal()
-                    .sync_block(fictive_miniblock_number, false),
-            )
-            .unwrap()
-            .unwrap();
-        let last_non_fictive_miniblock_data = rt_handle
-            .block_on(
-                connection
-                    .sync_dal()
-                    .sync_block(fictive_miniblock_number - 1, false),
-            )
-            .unwrap()
-            .unwrap();
-        let fictive_miniblock_data = MiniblockExecutionData {
-            number: fictive_miniblock_data.number,
-            timestamp: fictive_miniblock_data.timestamp,
-            prev_block_hash: last_non_fictive_miniblock_data.hash.unwrap_or_default(),
-            virtual_blocks: fictive_miniblock_data.virtual_blocks.unwrap_or(0),
-            txs: Vec::new(),
-        };
 
-        let (mut vm, _storage_view) =
+        let fictive_miniblock_data =
+            Self::create_fictive_miniblock(&rt_handle, &mut connection, fictive_miniblock_number)?;
+
+        let (vm, _storage_view) =
             create_vm(rt_handle.clone(), l1_batch_number, connection, l2_chain_id)
                 .context("failed to create vm for TeeVerifierInputProducer")?;
 
         info!("Started execution of l1_batch: {l1_batch_number:?}");
 
-        let next_miniblocks_data = miniblocks_execution_data
-            .iter()
-            .skip(1)
-            .map(Some)
-            .chain([Some(&fictive_miniblock_data)]);
-        let miniblocks_data = miniblocks_execution_data.iter().zip(next_miniblocks_data);
+        let vm_out = Self::execute_vm(miniblocks_execution_data, fictive_miniblock_data, vm)?;
 
-        for (miniblock_data, next_miniblock_data) in miniblocks_data {
-            trace!(
-                "Started execution of miniblock: {:?}, executing {:?} transactions",
-                miniblock_data.number,
-                miniblock_data.txs.len(),
-            );
-            for tx in &miniblock_data.txs {
-                trace!("Started execution of tx: {tx:?}");
-                execute_tx(tx, &mut vm)
-                    .context("failed to execute transaction in TeeVerifierInputProducer")?;
-                trace!("Finished execution of tx: {tx:?}");
-            }
-            if let Some(next_miniblock_data) = next_miniblock_data {
-                vm.start_new_l2_block(L2BlockEnv::from_miniblock_data(next_miniblock_data));
-            }
-
-            trace!(
-                "Finished execution of miniblock: {:?}",
-                miniblock_data.number
-            );
-        }
-
-        let vm_out = vm.finish_batch();
-
-        let instructions: Vec<TreeInstruction> = vm_out
-            .final_execution_state
-            .deduplicated_storage_log_queries
-            .into_iter()
-            .zip(bowp.logs.iter())
-            .map(|(log_query, tree_log_entry)| {
-                let key = StorageKey::new(
-                    AccountTreeId::new(log_query.address),
-                    H256(log_query.key.into()),
-                )
-                .hashed_key_u256();
-
-                Ok(match (log_query.rw_flag, tree_log_entry.base) {
-                    (true, TreeLogEntry::Updated { leaf_index, .. }) => TreeInstruction::write(
-                        key,
-                        leaf_index,
-                        H256(log_query.written_value.into()),
-                    ),
-                    (true, TreeLogEntry::Inserted) => {
-                        let leaf_index = idx;
-                        idx += 1;
-                        TreeInstruction::write(
-                            key,
-                            leaf_index,
-                            H256(log_query.written_value.into()),
-                        )
-                    }
-                    (false, TreeLogEntry::Read { value, .. }) => {
-                        if log_query.read_value != value.into_uint() {
-                            error!(
-                                "🛑 🛑 Failed to map LogQuery to TreeInstruction: {:#?} != {:#?}",
-                                log_query.read_value, value
-                            );
-                            bail!(
-                                "Failed to map LogQuery to TreeInstruction: {:#?} != {:#?}",
-                                log_query.read_value,
-                                value
-                            );
-                        }
-                        TreeInstruction::Read(key)
-                    }
-                    (false, TreeLogEntry::ReadMissingKey { .. }) => TreeInstruction::Read(key),
-                    _ => {
-                        error!("🛑 🛑 Failed to map LogQuery to TreeInstruction");
-                        bail!("Failed to map LogQuery to TreeInstruction");
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let instructions: Vec<TreeInstruction> =
+            Self::generate_tree_instructions(enumeration_index, &bowp, vm_out)?;
 
         // `verify_proofs` will panic!() if something does not add up.
         if !bowp.verify_proofs(&Blake2Hasher, old_root_hash, &instructions) {
@@ -282,6 +204,129 @@ impl TeeVerifierInputProducer {
         let tee_verifier_input = TeeVerifierInput {};
 
         Ok(tee_verifier_input)
+    }
+
+    fn execute_vm<S: WriteStorage>(
+        miniblocks_execution_data: Vec<MiniblockExecutionData>,
+        fictive_miniblock_data: MiniblockExecutionData,
+        mut vm: VmInstance<S, HistoryEnabled>,
+    ) -> anyhow::Result<FinishedL1Batch> {
+        let next_miniblocks_data = miniblocks_execution_data
+            .iter()
+            .skip(1)
+            .chain([&fictive_miniblock_data]);
+
+        let miniblocks_data = miniblocks_execution_data.iter().zip(next_miniblocks_data);
+
+        for (miniblock_data, next_miniblock_data) in miniblocks_data {
+            trace!(
+                "Started execution of miniblock: {:?}, executing {:?} transactions",
+                miniblock_data.number,
+                miniblock_data.txs.len(),
+            );
+            for tx in &miniblock_data.txs {
+                trace!("Started execution of tx: {tx:?}");
+                execute_tx(tx, &mut vm)
+                    .context("failed to execute transaction in TeeVerifierInputProducer")?;
+                trace!("Finished execution of tx: {tx:?}");
+            }
+            vm.start_new_l2_block(L2BlockEnv::from_miniblock_data(next_miniblock_data));
+
+            trace!(
+                "Finished execution of miniblock: {:?}",
+                miniblock_data.number
+            );
+        }
+
+        Ok(vm.finish_batch())
+    }
+
+    fn create_fictive_miniblock(
+        rt_handle: &Handle,
+        connection: &mut Connection<Core>,
+        fictive_miniblock_number: MiniblockNumber,
+    ) -> anyhow::Result<MiniblockExecutionData> {
+        let fictive_miniblock_data = rt_handle
+            .block_on(
+                connection
+                    .sync_dal()
+                    .sync_block(fictive_miniblock_number, false),
+            )
+            .context("Failed to get fictive miniblock")?
+            .context("Failed to get fictive miniblock")?;
+        let last_non_fictive_miniblock_data = rt_handle
+            .block_on(
+                connection
+                    .sync_dal()
+                    .sync_block(fictive_miniblock_number - 1, false),
+            )
+            .context("Failed to get last miniblock")?
+            .context("Failed to get last miniblock")?;
+
+        Ok(MiniblockExecutionData {
+            number: fictive_miniblock_data.number,
+            timestamp: fictive_miniblock_data.timestamp,
+            prev_block_hash: last_non_fictive_miniblock_data.hash.unwrap_or_default(),
+            virtual_blocks: fictive_miniblock_data.virtual_blocks.unwrap_or(0),
+            txs: Vec::new(),
+        })
+    }
+
+    fn map_log_tree(
+        log_query: &LogQuery,
+        tree_log_entry: &TreeLogEntry,
+        idx: &mut u64,
+    ) -> anyhow::Result<TreeInstruction> {
+        let key = StorageKey::new(
+            AccountTreeId::new(log_query.address),
+            H256(log_query.key.into()),
+        )
+        .hashed_key_u256();
+        Ok(match (log_query.rw_flag, *tree_log_entry) {
+            (true, TreeLogEntry::Updated { leaf_index, .. }) => {
+                TreeInstruction::write(key, leaf_index, H256(log_query.written_value.into()))
+            }
+            (true, TreeLogEntry::Inserted) => {
+                let leaf_index = *idx;
+                *idx += 1;
+                TreeInstruction::write(key, leaf_index, H256(log_query.written_value.into()))
+            }
+            (false, TreeLogEntry::Read { value, .. }) => {
+                if log_query.read_value != value.into_uint() {
+                    error!(
+                        "🛑 🛑 Failed to map LogQuery to TreeInstruction: {:#?} != {:#?}",
+                        log_query.read_value, value
+                    );
+                    bail!(
+                        "Failed to map LogQuery to TreeInstruction: {:#?} != {:#?}",
+                        log_query.read_value,
+                        value
+                    );
+                }
+                TreeInstruction::Read(key)
+            }
+            (false, TreeLogEntry::ReadMissingKey { .. }) => TreeInstruction::Read(key),
+            _ => {
+                error!("🛑 🛑 Failed to map LogQuery to TreeInstruction");
+                bail!("Failed to map LogQuery to TreeInstruction");
+            }
+        })
+    }
+
+    fn generate_tree_instructions(
+        mut idx: u64,
+        bowp: &TeeBlockOutputWithProofs,
+        vm_out: FinishedL1Batch,
+    ) -> anyhow::Result<Vec<TreeInstruction>> {
+        vm_out
+            .final_execution_state
+            .deduplicated_storage_log_queries
+            .into_iter()
+            .zip(bowp.logs.iter())
+            .map(|(log_query, tree_log_entry)| {
+                Self::map_log_tree(&log_query, &tree_log_entry.base, &mut idx)
+            })
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
