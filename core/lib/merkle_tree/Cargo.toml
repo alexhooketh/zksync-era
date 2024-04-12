@@ -20,6 +20,7 @@ zksync_utils.workspace = true
 leb128.workspace = true
 once_cell.workspace = true
 rayon.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 thread_local.workspace = true
 tracing.workspace = true

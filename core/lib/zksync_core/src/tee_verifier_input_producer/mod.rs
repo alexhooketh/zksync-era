@@ -20,19 +20,19 @@ use zksync_object_store::{ObjectStore, ObjectStoreFactory};
 use zksync_prover_interface::inputs::{PrepareBasicCircuitsJob, StorageLogMetadata};
 use zksync_queued_job_processor::JobProcessor;
 use zksync_state::WriteStorage;
+use zksync_tee_verifier::TeeVerifierInput;
 use zksync_types::{
-    block::MiniblockExecutionData, ethabi::ethereum_types::BigEndianHash,
-    tee_verifier_input::TeeVerifierInput, zk_evm_types::LogQuery, AccountTreeId, L1BatchNumber,
-    L2ChainId, MiniblockNumber, StorageKey, H256,
+    block::MiniblockExecutionData, ethabi::ethereum_types::BigEndianHash, zk_evm_types::LogQuery,
+    AccountTreeId, L1BatchNumber, L2ChainId, MiniblockNumber, StorageKey, H256,
 };
 
 use self::metrics::METRICS;
 
 mod metrics;
-/// Component that extracts all data (from DB) necessary to run a Basic Witness Generator.
+/// Component that extracts all data (from DB) necessary to run a TEE Verifier.
 /// Does this by rerunning an entire L1Batch and extracting information from both the VM run and DB.
-/// This component will upload Witness Inputs to the object store.
-/// This allows Witness Generator workflow (that needs only Basic Witness Generator Inputs)
+/// This component will upload TEE Verifier Inputs to the object store.
+/// This allows the TEE Verifier workflow (that needs only TEE Verifier Inputs)
 /// to be run only using the object store information, having no other external dependency.
 #[derive(Debug)]
 pub struct TeeVerifierInputProducer {
@@ -160,35 +160,20 @@ impl TeeVerifierInputProducer {
         let fictive_miniblock_data =
             Self::create_fictive_miniblock(&rt_handle, &mut connection, fictive_miniblock_number)?;
 
-        let (vm, _storage_view) =
-            create_vm(rt_handle.clone(), l1_batch_number, connection, l2_chain_id)
-                .context("failed to create vm for TeeVerifierInputProducer")?;
-
         info!("Started execution of l1_batch: {l1_batch_number:?}");
 
-        let vm_out = Self::execute_vm(miniblocks_execution_data, fictive_miniblock_data, vm)?;
+        let tee_verifier_input = TeeVerifierInput {
+            l1_batch_number,
+            l2_chain_id,
+            enumeration_index,
+            block_output_with_proofs: bowp.inner,
+            old_root_hash,
+            new_root_hash,
+            miniblocks_execution_data,
+            fictive_miniblock_data,
+        };
 
-        let instructions: Vec<TreeInstruction> =
-            Self::generate_tree_instructions(enumeration_index, &bowp, vm_out)?;
-
-        // `verify_proofs` will panic!() if something does not add up.
-        if !bowp.verify_proofs(&Blake2Hasher, old_root_hash, &instructions) {
-            error!("🛑 🛑 Failed to verify_proofs {l1_batch_number} correctly - oh no!");
-            bail!("Failed to verify_proofs {l1_batch_number} correctly - oh no!");
-        }
-
-        if bowp.root_hash() != Some(new_root_hash) {
-            error!(
-                "🛑 🛑 Failed to verify {l1_batch_number} correctly - oh no! {:#?} != {:#?}",
-                bowp.root_hash(),
-                new_root_hash
-            );
-            bail!(
-                "Failed to verify {l1_batch_number} correctly - oh no! {:#?} != {:#?}",
-                bowp.root_hash(),
-                new_root_hash
-            );
-        }
+        Self::run_tee_verifier(rt_handle, connection, tee_verifier_input.clone())?;
 
         info!("🚀 Looks like we verified {l1_batch_number} correctly - whoop, whoop! 🚀");
 
@@ -201,9 +186,54 @@ impl TeeVerifierInputProducer {
             l1_batch_number.0
         );
 
-        let tee_verifier_input = TeeVerifierInput {};
-
         Ok(tee_verifier_input)
+    }
+
+    fn run_tee_verifier(
+        rt_handle: Handle,
+        connection: Connection<Core>,
+        tee_verifier_input: TeeVerifierInput,
+    ) -> anyhow::Result<()> {
+        let TeeVerifierInput {
+            l1_batch_number,
+            l2_chain_id,
+            enumeration_index,
+            block_output_with_proofs,
+            old_root_hash,
+            new_root_hash,
+            miniblocks_execution_data,
+            fictive_miniblock_data,
+        } = tee_verifier_input;
+
+        let (vm, _storage_view) =
+            create_vm(rt_handle.clone(), l1_batch_number, connection, l2_chain_id)
+                .context("failed to create vm for TeeVerifierInputProducer")?;
+
+        let vm_out = Self::execute_vm(miniblocks_execution_data, fictive_miniblock_data, vm)?;
+
+        let instructions: Vec<TreeInstruction> =
+            Self::generate_tree_instructions(enumeration_index, &block_output_with_proofs, vm_out)?;
+
+        // `verify_proofs` will panic!() if something does not add up.
+        if !block_output_with_proofs.verify_proofs(&Blake2Hasher, old_root_hash, &instructions) {
+            error!("🛑 🛑 Failed to verify_proofs {l1_batch_number} correctly - oh no!");
+            bail!("Failed to verify_proofs {l1_batch_number} correctly - oh no!");
+        }
+
+        if block_output_with_proofs.root_hash() != Some(new_root_hash) {
+            error!(
+                "🛑 🛑 Failed to verify {l1_batch_number} correctly - oh no! {:#?} != {:#?}",
+                block_output_with_proofs.root_hash(),
+                new_root_hash
+            );
+            bail!(
+                "Failed to verify {l1_batch_number} correctly - oh no! {:#?} != {:#?}",
+                block_output_with_proofs.root_hash(),
+                new_root_hash
+            );
+        }
+
+        Ok(())
     }
 
     fn execute_vm<S: WriteStorage>(
@@ -315,7 +345,7 @@ impl TeeVerifierInputProducer {
 
     fn generate_tree_instructions(
         mut idx: u64,
-        bowp: &TeeBlockOutputWithProofs,
+        bowp: &BlockOutputWithProofs,
         vm_out: FinishedL1Batch,
     ) -> anyhow::Result<Vec<TreeInstruction>> {
         vm_out
