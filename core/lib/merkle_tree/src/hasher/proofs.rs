@@ -14,10 +14,6 @@ use crate::{
 impl BlockOutputWithProofs {
     /// Verifies this output against the trusted old root hash of the tree and
     /// the applied instructions.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the proof doesn't verify.
     #[must_use = "this method returns a boolean value, use it to check the result"]
     pub fn verify_proofs(
         &self,
