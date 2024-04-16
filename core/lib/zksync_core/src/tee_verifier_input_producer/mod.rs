@@ -23,7 +23,7 @@ use zksync_state::{InMemoryStorage, PostgresStorage, ReadStorage, StorageView, W
 use zksync_tee_verifier::TeeVerifierInput;
 use zksync_types::{
     block::MiniblockExecutionData, ethabi::ethereum_types::BigEndianHash, zk_evm_types::LogQuery,
-    AccountTreeId, L1BatchNumber, L2ChainId, MiniblockNumber, StorageKey, StorageValue, H256,
+    AccountTreeId, L1BatchNumber, L2ChainId, MiniblockNumber, StorageKey, H256,
 };
 use zksync_utils::{bytecode::hash_bytecode, u256_to_h256};
 
@@ -197,9 +197,6 @@ impl TeeVerifierInputProducer {
 
         let enumeration_index = prepare_basic_circuits_job.next_enumeration_index();
 
-        let (block_output_with_proofs, initial_read_values) =
-            Self::get_bwop_and_initial_values(prepare_basic_circuits_job);
-
         let mut raw_storage = InMemoryStorage::with_custom_system_contracts_and_chain_id(
             l2_chain_id,
             hash_bytecode,
@@ -213,12 +210,8 @@ impl TeeVerifierInputProducer {
             }
         }
 
-        initial_read_values
-            .into_iter()
-            .for_each(|(key, enumeration_index, val)| {
-                trace!("raw_storage.set_value_enum({key:?}, {enumeration_index}, {val})");
-                raw_storage.set_value_enum(key, enumeration_index, val)
-            });
+        let block_output_with_proofs =
+            Self::get_bwop_and_set_initial_values(prepare_basic_circuits_job, &mut raw_storage);
 
         let storage_view = Rc::new(RefCell::new(StorageView::new(&raw_storage)));
 
@@ -251,11 +244,11 @@ impl TeeVerifierInputProducer {
         Ok(())
     }
 
-    fn get_bwop_and_initial_values(
+    fn get_bwop_and_set_initial_values(
         value: PrepareBasicCircuitsJob,
-    ) -> (BlockOutputWithProofs, Vec<(StorageKey, u64, StorageValue)>) {
+        raw_storage: &mut InMemoryStorage,
+    ) -> BlockOutputWithProofs {
         let merkle_paths = value.into_merkle_paths();
-        let mut initial_read_values = Vec::new();
         let logs = merkle_paths
             .into_iter()
             .map(
@@ -274,11 +267,11 @@ impl TeeVerifierInputProducer {
                     let base: TreeLogEntry = match (is_write, first_write, leaf_enumeration_index) {
                         (false, _, 0) => TreeLogEntry::ReadMissingKey,
                         (false, _, _) => {
-                            initial_read_values.push((
+                            raw_storage.set_value_enum(
                                 leaf_storage_key,
                                 leaf_enumeration_index,
                                 value_read.into(),
-                            ));
+                            );
                             TreeLogEntry::Read {
                                 leaf_index: leaf_enumeration_index,
                                 value: value_read.into(),
@@ -286,11 +279,11 @@ impl TeeVerifierInputProducer {
                         }
                         (true, true, _) => TreeLogEntry::Inserted,
                         (true, false, _) => {
-                            initial_read_values.push((
+                            raw_storage.set_value_enum(
                                 leaf_storage_key,
                                 leaf_enumeration_index,
                                 value_read.into(),
-                            ));
+                            );
                             TreeLogEntry::Updated {
                                 leaf_index: leaf_enumeration_index,
                                 previous_value: value_read.into(),
@@ -306,13 +299,10 @@ impl TeeVerifierInputProducer {
             )
             .collect();
 
-        (
-            BlockOutputWithProofs {
-                logs,
-                leaf_count: 0,
-            },
-            initial_read_values,
-        )
+        BlockOutputWithProofs {
+            logs,
+            leaf_count: 0,
+        }
     }
 
     fn execute_vm<S: WriteStorage>(
