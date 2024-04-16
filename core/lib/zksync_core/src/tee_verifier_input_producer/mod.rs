@@ -95,6 +95,11 @@ impl TeeVerifierInputProducer {
 
         let last_batch_miniblock_number = miniblocks_execution_data.first().unwrap().number - 1;
 
+        let l1_batch_header = rt_handle
+            .block_on(connection.blocks_dal().get_l1_batch_header(l1_batch_number))
+            .with_context(|| format!("header is missing for L1 batch #{l1_batch_number}"))?
+            .unwrap();
+
         let l1_batch_params_provider = rt_handle
             .block_on(L1BatchParamsProvider::new(&mut connection))
             .context("failed initializing L1 batch params provider")?;
@@ -131,12 +136,7 @@ impl TeeVerifierInputProducer {
         );
         let mut real_storage_view = StorageView::new(pg_storage);
 
-        let header = rt_handle
-            .block_on(connection.blocks_dal().get_l1_batch_header(l1_batch_number))
-            .with_context(|| format!("header is missing for L1 batch #{l1_batch_number}"))?
-            .unwrap();
-
-        let used_contracts = header
+        let used_contracts = l1_batch_header
             .used_contract_hashes
             .into_iter()
             .map(|hash| {
