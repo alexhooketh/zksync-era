@@ -398,7 +398,9 @@ struct StorageLogMetadataSnapshot {
 impl From<StorageLogMetadata> for StorageLogMetadataSnapshot {
     fn from(metadata: StorageLogMetadata) -> Self {
         let mut leaf_hashed_key = [0_u8; 32];
-        metadata.leaf_hashed_key.to_big_endian(&mut leaf_hashed_key);
+        metadata
+            .leaf_storage_key
+            .to_big_endian(&mut leaf_hashed_key);
 
         Self {
             root_hash: metadata.root_hash,

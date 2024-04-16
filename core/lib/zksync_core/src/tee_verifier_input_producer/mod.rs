@@ -1,4 +1,4 @@
-use std::{ops::Deref, sync::Arc, time::Instant};
+use std::{cell::RefCell, ops::Deref, rc::Rc, sync::Arc, time::Instant};
 
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -9,7 +9,7 @@ use multivm::{
 };
 use tokio::{runtime::Handle, task::JoinHandle};
 use tracing::{debug, error, info, trace, warn};
-use vm_utils::{create_vm, execute_tx};
+use vm_utils::{execute_tx, storage::L1BatchParamsProvider};
 use zksync_crypto::hasher::blake2::Blake2Hasher;
 use zksync_dal::{tee_verifier_input_producer_dal::JOB_MAX_ATTEMPT, ConnectionPool, Core, CoreDal};
 use zksync_db_connection::connection::Connection;
@@ -19,12 +19,13 @@ use zksync_merkle_tree::{
 use zksync_object_store::{ObjectStore, ObjectStoreFactory};
 use zksync_prover_interface::inputs::{PrepareBasicCircuitsJob, StorageLogMetadata};
 use zksync_queued_job_processor::JobProcessor;
-use zksync_state::WriteStorage;
+use zksync_state::{InMemoryStorage, PostgresStorage, ReadStorage, StorageView, WriteStorage};
 use zksync_tee_verifier::TeeVerifierInput;
 use zksync_types::{
     block::MiniblockExecutionData, ethabi::ethereum_types::BigEndianHash, zk_evm_types::LogQuery,
     AccountTreeId, L1BatchNumber, L2ChainId, MiniblockNumber, StorageKey, H256,
 };
+use zksync_utils::{bytecode::hash_bytecode, u256_to_h256};
 
 use self::metrics::METRICS;
 
@@ -43,21 +44,24 @@ pub struct TeeVerifierInputProducer {
 
 #[derive(Debug)]
 pub struct TeeBlockOutputWithProofs {
-    pub inner: BlockOutputWithProofs,
+    pub block_output_with_proofs: BlockOutputWithProofs,
+    pub read_keys: Vec<StorageKey>,
 }
 
 impl Deref for TeeBlockOutputWithProofs {
     type Target = BlockOutputWithProofs;
 
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        &self.block_output_with_proofs
     }
 }
 
 impl From<PrepareBasicCircuitsJob> for TeeBlockOutputWithProofs {
     fn from(value: PrepareBasicCircuitsJob) -> Self {
         let merkle_paths = value.into_merkle_paths();
-        let logs = merkle_paths
+
+        //let read_keys : Vec<Option<StorageKey>>;
+        let (read_keys, logs) = merkle_paths
             .into_iter()
             .map(
                 |StorageLogMetadata {
@@ -67,6 +71,7 @@ impl From<PrepareBasicCircuitsJob> for TeeBlockOutputWithProofs {
                      first_write,
                      leaf_enumeration_index,
                      value_read,
+                     leaf_storage_key,
                      ..
                  }| {
                     let root_hash = root_hash.into();
@@ -83,20 +88,24 @@ impl From<PrepareBasicCircuitsJob> for TeeBlockOutputWithProofs {
                             previous_value: value_read.into(),
                         },
                     };
-                    TreeLogEntryWithProof {
-                        base,
-                        merkle_path,
-                        root_hash,
-                    }
+                    (
+                        leaf_storage_key,
+                        TreeLogEntryWithProof {
+                            base,
+                            merkle_path,
+                            root_hash,
+                        },
+                    )
                 },
             )
-            .collect();
+            .unzip();
 
         TeeBlockOutputWithProofs {
-            inner: BlockOutputWithProofs {
+            block_output_with_proofs: BlockOutputWithProofs {
                 logs,
                 leaf_count: 0,
             },
+            read_keys,
         }
     }
 }
@@ -160,20 +169,96 @@ impl TeeVerifierInputProducer {
         let fictive_miniblock_data =
             Self::create_fictive_miniblock(&rt_handle, &mut connection, fictive_miniblock_number)?;
 
+        let last_batch_miniblock_number = miniblocks_execution_data.first().unwrap().number - 1;
+
+        let l1_batch_params_provider = rt_handle
+            .block_on(L1BatchParamsProvider::new(&mut connection))
+            .context("failed initializing L1 batch params provider")?;
+
+        let first_miniblock_in_batch = rt_handle
+            .block_on(
+                l1_batch_params_provider
+                    .load_first_miniblock_in_batch(&mut connection, l1_batch_number),
+            )
+            .with_context(|| {
+                format!("failed loading first miniblock in L1 batch #{l1_batch_number}")
+            })?
+            .with_context(|| format!("no miniblocks persisted for L1 batch #{l1_batch_number}"))?;
+
+        // In the state keeper, this value is used to reject execution.
+        // All batches have already been executed by State Keeper.
+        // This means we don't want to reject any execution, therefore we're using MAX as an allow all.
+        let validation_computational_gas_limit = u32::MAX;
+
+        let header = rt_handle
+            .block_on(connection.blocks_dal().get_l1_batch_header(l1_batch_number))
+            .with_context(|| format!("header is missing for L1 batch #{l1_batch_number}"))?
+            .unwrap();
+
+        let (system_env, l1_batch_env) = rt_handle
+            .block_on(l1_batch_params_provider.load_l1_batch_params(
+                &mut connection,
+                &first_miniblock_in_batch,
+                validation_computational_gas_limit,
+                l2_chain_id,
+            ))
+            .context("expected miniblock to be executed and sealed")?;
+
+        let pg_storage = PostgresStorage::new(
+            rt_handle.clone(),
+            connection,
+            last_batch_miniblock_number,
+            true,
+        );
+        let mut real_storage_view = StorageView::new(pg_storage);
+
+        let TeeBlockOutputWithProofs {
+            block_output_with_proofs,
+            read_keys,
+        } = bowp;
+
+        let initial_read_values = read_keys
+            .into_iter()
+            .zip(block_output_with_proofs.logs.iter())
+            .map(|(key, log)| match log.base {
+                TreeLogEntry::Updated { leaf_index, .. } => {
+                    Some((key, leaf_index, real_storage_view.read_value(&key)))
+                }
+                TreeLogEntry::Read { leaf_index, .. } => {
+                    Some((key, leaf_index, real_storage_view.read_value(&key)))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        let used_contracts = header
+            .used_contract_hashes
+            .into_iter()
+            .map(|hash| {
+                ReadStorage::load_factory_dep(&mut real_storage_view, u256_to_h256(hash))
+                    .map(|bytes| (u256_to_h256(hash), bytes))
+            })
+            .collect();
+
         info!("Started execution of l1_batch: {l1_batch_number:?}");
 
         let tee_verifier_input = TeeVerifierInput {
-            l1_batch_number,
             l2_chain_id,
+            l1_batch_number,
             enumeration_index,
-            block_output_with_proofs: bowp.inner,
+            block_output_with_proofs,
             old_root_hash,
             new_root_hash,
             miniblocks_execution_data,
             fictive_miniblock_data,
+            l1_batch_env,
+            system_env,
+            initial_read_values,
+            used_contracts,
         };
 
-        Self::run_tee_verifier(rt_handle, connection, tee_verifier_input.clone())?;
+        Self::run_tee_verifier(tee_verifier_input.clone())?;
 
         info!("🚀 Looks like we verified {l1_batch_number} correctly - whoop, whoop! 🚀");
 
@@ -189,25 +274,46 @@ impl TeeVerifierInputProducer {
         Ok(tee_verifier_input)
     }
 
-    fn run_tee_verifier(
-        rt_handle: Handle,
-        connection: Connection<Core>,
-        tee_verifier_input: TeeVerifierInput,
-    ) -> anyhow::Result<()> {
+    fn run_tee_verifier(tee_verifier_input: TeeVerifierInput) -> anyhow::Result<()> {
         let TeeVerifierInput {
-            l1_batch_number,
             l2_chain_id,
+            l1_batch_number,
             enumeration_index,
             block_output_with_proofs,
             old_root_hash,
             new_root_hash,
             miniblocks_execution_data,
             fictive_miniblock_data,
+            l1_batch_env,
+            system_env,
+            initial_read_values,
+            used_contracts,
         } = tee_verifier_input;
+        let mut raw_storage = InMemoryStorage::with_custom_system_contracts_and_chain_id(
+            l2_chain_id,
+            hash_bytecode,
+            Vec::with_capacity(0),
+        );
 
-        let (vm, _storage_view) =
-            create_vm(rt_handle.clone(), l1_batch_number, connection, l2_chain_id)
-                .context("failed to create vm for TeeVerifierInputProducer")?;
+        for val in used_contracts.into_iter() {
+            if let Some((hash, bytes)) = val {
+                trace!("raw_storage.store_factory_dep({hash}, bytes)");
+                raw_storage.store_factory_dep(hash, bytes)
+            }
+        }
+
+        initial_read_values
+            .into_iter()
+            .for_each(|(key, enumeration_index, val)| {
+                trace!("raw_storage.set_value_enum({key:?}, {enumeration_index}, {val})");
+                raw_storage.set_value_enum(key, enumeration_index, val)
+            });
+
+        // TODO enumeration_index
+
+        let storage_view = Rc::new(RefCell::new(StorageView::new(&raw_storage)));
+
+        let vm = VmInstance::new(l1_batch_env, system_env, storage_view);
 
         let vm_out = Self::execute_vm(miniblocks_execution_data, fictive_miniblock_data, vm)?;
 

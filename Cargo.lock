@@ -3719,6 +3719,7 @@ dependencies = [
  "hex",
  "itertools 0.10.5",
  "once_cell",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
@@ -8654,6 +8655,7 @@ dependencies = [
  "clap 4.4.6",
  "insta",
  "leb128",
+ "log",
  "once_cell",
  "rand 0.8.5",
  "rayon",
@@ -8925,6 +8927,7 @@ dependencies = [
 name = "zksync_tee_verifier"
 version = "0.1.0"
 dependencies = [
+ "multivm",
  "serde",
  "zksync_basic_types",
  "zksync_merkle_tree",

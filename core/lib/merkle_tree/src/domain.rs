@@ -222,7 +222,7 @@ impl ZkSyncTree {
                 is_write: !log.base.is_read(),
                 first_write: matches!(log.base, TreeLogEntry::Inserted),
                 merkle_paths,
-                leaf_hashed_key: instruction.key().hashed_key_u256(),
+                leaf_storage_key: instruction.key(),
                 leaf_enumeration_index: match instruction {
                     TreeInstruction::Write(entry) => entry.leaf_index,
                     TreeInstruction::Read(_) => match log.base {

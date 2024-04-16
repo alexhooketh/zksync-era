@@ -2,6 +2,8 @@
 
 use std::mem;
 
+use tracing::error;
+
 use crate::{
     hasher::{HashTree, HasherWithStats},
     types::{
@@ -22,23 +24,28 @@ impl BlockOutputWithProofs {
         instructions: &[TreeInstruction],
     ) -> bool {
         if instructions.len() != self.logs.len() {
+            error!("Mismatch in the length of instructions and logs");
             return false;
         }
 
         let mut root_hash = old_root_hash;
         for (op, &instruction) in self.logs.iter().zip(instructions) {
             if op.merkle_path.len() > TREE_DEPTH {
+                error!("op.merkle_path.len() > TREE_DEPTH");
                 return false;
             }
             if matches!(instruction, TreeInstruction::Read(_)) {
                 if op.root_hash != root_hash {
+                    error!("op.root_hash != root_hash");
                     return false;
                 }
                 if !op.base.is_read() {
+                    error!("!op.base.is_read()");
                     return false;
                 }
             } else {
                 if op.base.is_read() {
+                    error!("op.base.is_read()");
                     return false;
                 }
             }
@@ -58,11 +65,13 @@ impl BlockOutputWithProofs {
 
             let prev_hash = hasher.fold_merkle_path(&op.merkle_path, prev_entry);
             if prev_hash != root_hash {
+                error!("prev_hash != root_hash");
                 return false;
             }
             if let TreeInstruction::Write(new_entry) = instruction {
                 let next_hash = hasher.fold_merkle_path(&op.merkle_path, new_entry);
                 if next_hash != op.root_hash {
+                    error!("next_hash != op.root_hash");
                     return false;
                 }
             }

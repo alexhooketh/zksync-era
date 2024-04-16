@@ -3,7 +3,7 @@ use std::{convert::TryInto, fmt::Debug};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 use zksync_object_store::{serialize_using_bincode, Bucket, StoredObject};
-use zksync_types::{L1BatchNumber, H256, U256};
+use zksync_types::{L1BatchNumber, StorageKey, H256, U256};
 
 const HASH_LEN: usize = H256::len_bytes();
 
@@ -17,7 +17,7 @@ pub struct StorageLogMetadata {
     pub first_write: bool,
     #[serde_as(as = "Vec<Bytes>")]
     pub merkle_paths: Vec<[u8; HASH_LEN]>,
-    pub leaf_hashed_key: U256,
+    pub leaf_storage_key: StorageKey,
     pub leaf_enumeration_index: u64,
     // **NB.** For compatibility reasons, `#[serde_as(as = "Bytes")]` attributes are not added below.
     pub value_written: [u8; HASH_LEN],
@@ -27,7 +27,9 @@ pub struct StorageLogMetadata {
 impl StorageLogMetadata {
     pub fn leaf_hashed_key_array(&self) -> [u8; 32] {
         let mut result = [0_u8; 32];
-        self.leaf_hashed_key.to_little_endian(&mut result);
+        self.leaf_storage_key
+            .hashed_key_u256()
+            .to_little_endian(&mut result);
         result
     }
 
@@ -146,6 +148,8 @@ pub struct BasicCircuitWitnessGeneratorInput {
 
 #[cfg(test)]
 mod tests {
+    use zksync_types::AccountTreeId;
+
     use super::*;
 
     #[test]
@@ -159,7 +163,7 @@ mod tests {
                 is_write: i % 2 == 0,
                 first_write: i % 3 == 0,
                 merkle_paths,
-                leaf_hashed_key: U256::from(i),
+                leaf_storage_key: StorageKey::new(AccountTreeId::default(), H256::from(i)),
                 leaf_enumeration_index: i + 1,
                 value_written: [i as u8; 32],
                 value_read: [0; 32],
