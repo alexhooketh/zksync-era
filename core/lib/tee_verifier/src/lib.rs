@@ -6,7 +6,7 @@
 
 use multivm::interface::{L1BatchEnv, SystemEnv};
 use serde::{Deserialize, Serialize};
-use zksync_basic_types::{L1BatchNumber, L2ChainId, H256};
+use zksync_basic_types::{L1BatchNumber, H256};
 use zksync_object_store::{serialize_using_bincode, Bucket, StoredObject};
 use zksync_prover_interface::inputs::PrepareBasicCircuitsJob;
 use zksync_types::block::MiniblockExecutionData;
@@ -15,9 +15,6 @@ use zksync_types::block::MiniblockExecutionData;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeeVerifierInput {
     pub prepare_basic_circuits_job: PrepareBasicCircuitsJob,
-    pub l2_chain_id: L2ChainId,
-    pub l1_batch_number: L1BatchNumber,
-    pub old_root_hash: H256,
     pub new_root_hash: H256,
     pub miniblocks_execution_data: Vec<MiniblockExecutionData>,
     pub fictive_miniblock_data: MiniblockExecutionData,

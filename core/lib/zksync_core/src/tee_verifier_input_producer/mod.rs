@@ -1,3 +1,6 @@
+//! Produces input for the TEE verifier
+
+// RUST_LOG=warn,zksync_core::tee_verifier_input_producer=debug,zksync_core::basic_witness_input_producer=debug
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
 use anyhow::{anyhow, bail, Context};
@@ -71,14 +74,6 @@ impl TeeVerifierInputProducer {
             .block_on(connection_pool.connection())
             .context("failed to get connection for TeeVerifierInputProducer")?;
 
-        let old_root_hash = rt_handle
-            .block_on(
-                connection
-                    .blocks_dal()
-                    .get_l1_batch_state_root(l1_batch_number - 1),
-            )?
-            .ok_or(anyhow!("Failed to get old root hash"))?;
-
         let new_root_hash = rt_handle
             .block_on(
                 connection
@@ -119,11 +114,6 @@ impl TeeVerifierInputProducer {
         // This means we don't want to reject any execution, therefore we're using MAX as an allow all.
         let validation_computational_gas_limit = u32::MAX;
 
-        let header = rt_handle
-            .block_on(connection.blocks_dal().get_l1_batch_header(l1_batch_number))
-            .with_context(|| format!("header is missing for L1 batch #{l1_batch_number}"))?
-            .unwrap();
-
         let (system_env, l1_batch_env) = rt_handle
             .block_on(l1_batch_params_provider.load_l1_batch_params(
                 &mut connection,
@@ -141,6 +131,11 @@ impl TeeVerifierInputProducer {
         );
         let mut real_storage_view = StorageView::new(pg_storage);
 
+        let header = rt_handle
+            .block_on(connection.blocks_dal().get_l1_batch_header(l1_batch_number))
+            .with_context(|| format!("header is missing for L1 batch #{l1_batch_number}"))?
+            .unwrap();
+
         let used_contracts = header
             .used_contract_hashes
             .into_iter()
@@ -154,9 +149,6 @@ impl TeeVerifierInputProducer {
 
         let tee_verifier_input = TeeVerifierInput {
             prepare_basic_circuits_job,
-            l2_chain_id,
-            l1_batch_number,
-            old_root_hash,
             new_root_hash,
             miniblocks_execution_data,
             fictive_miniblock_data,
@@ -184,9 +176,6 @@ impl TeeVerifierInputProducer {
     fn run_tee_verifier(tee_verifier_input: TeeVerifierInput) -> anyhow::Result<()> {
         let TeeVerifierInput {
             prepare_basic_circuits_job,
-            l2_chain_id,
-            l1_batch_number,
-            old_root_hash,
             new_root_hash,
             miniblocks_execution_data,
             fictive_miniblock_data,
@@ -195,6 +184,9 @@ impl TeeVerifierInputProducer {
             used_contracts,
         } = tee_verifier_input;
 
+        let old_root_hash = l1_batch_env.previous_batch_hash.unwrap();
+        let l1_batch_number = l1_batch_env.number;
+        let l2_chain_id = system_env.chain_id;
         let enumeration_index = prepare_basic_circuits_job.next_enumeration_index();
 
         let mut raw_storage = InMemoryStorage::with_custom_system_contracts_and_chain_id(
