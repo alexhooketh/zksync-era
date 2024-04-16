@@ -1,4 +1,4 @@
-use std::{cell::RefCell, ops::Deref, rc::Rc, sync::Arc, time::Instant};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -40,84 +40,6 @@ pub struct TeeVerifierInputProducer {
     connection_pool: ConnectionPool<Core>,
     l2_chain_id: L2ChainId,
     object_store: Arc<dyn ObjectStore>,
-}
-
-#[derive(Debug)]
-pub struct TeeBlockOutputWithProofs {
-    pub block_output_with_proofs: BlockOutputWithProofs,
-    pub initial_read_values: Vec<(StorageKey, u64, StorageValue)>,
-}
-
-impl Deref for TeeBlockOutputWithProofs {
-    type Target = BlockOutputWithProofs;
-
-    fn deref(&self) -> &Self::Target {
-        &self.block_output_with_proofs
-    }
-}
-
-impl From<PrepareBasicCircuitsJob> for TeeBlockOutputWithProofs {
-    fn from(value: PrepareBasicCircuitsJob) -> Self {
-        let merkle_paths = value.into_merkle_paths();
-        let mut initial_read_values = Vec::new();
-        let logs = merkle_paths
-            .into_iter()
-            .map(
-                |StorageLogMetadata {
-                     root_hash,
-                     merkle_paths,
-                     is_write,
-                     first_write,
-                     leaf_enumeration_index,
-                     value_read,
-                     leaf_storage_key,
-                     ..
-                 }| {
-                    let root_hash = root_hash.into();
-                    let merkle_path = merkle_paths.into_iter().map(|x| x.into()).collect();
-                    let base: TreeLogEntry = match (is_write, first_write, leaf_enumeration_index) {
-                        (false, _, 0) => TreeLogEntry::ReadMissingKey,
-                        (false, _, _) => {
-                            initial_read_values.push((
-                                leaf_storage_key,
-                                leaf_enumeration_index,
-                                value_read.into(),
-                            ));
-                            TreeLogEntry::Read {
-                                leaf_index: leaf_enumeration_index,
-                                value: value_read.into(),
-                            }
-                        }
-                        (true, true, _) => TreeLogEntry::Inserted,
-                        (true, false, _) => {
-                            initial_read_values.push((
-                                leaf_storage_key,
-                                leaf_enumeration_index,
-                                value_read.into(),
-                            ));
-                            TreeLogEntry::Updated {
-                                leaf_index: leaf_enumeration_index,
-                                previous_value: value_read.into(),
-                            }
-                        }
-                    };
-                    TreeLogEntryWithProof {
-                        base,
-                        merkle_path,
-                        root_hash,
-                    }
-                },
-            )
-            .collect();
-
-        TeeBlockOutputWithProofs {
-            block_output_with_proofs: BlockOutputWithProofs {
-                logs,
-                leaf_count: 0,
-            },
-            initial_read_values,
-        }
-    }
 }
 
 impl TeeVerifierInputProducer {
@@ -250,7 +172,7 @@ impl TeeVerifierInputProducer {
         info!("Finished execution of l1_batch: {l1_batch_number:?}");
 
         METRICS.process_batch_time.observe(started_at.elapsed());
-        info!(
+        debug!(
             "TeeVerifierInputProducer took {:?} for L1BatchNumber {}",
             started_at.elapsed(),
             l1_batch_number.0
@@ -275,10 +197,8 @@ impl TeeVerifierInputProducer {
 
         let enumeration_index = prepare_basic_circuits_job.next_enumeration_index();
 
-        let TeeBlockOutputWithProofs {
-            block_output_with_proofs,
-            initial_read_values,
-        } = prepare_basic_circuits_job.into();
+        let (block_output_with_proofs, initial_read_values) =
+            Self::get_bwop_and_initial_values(prepare_basic_circuits_job);
 
         let mut raw_storage = InMemoryStorage::with_custom_system_contracts_and_chain_id(
             l2_chain_id,
@@ -329,6 +249,70 @@ impl TeeVerifierInputProducer {
         }
 
         Ok(())
+    }
+
+    fn get_bwop_and_initial_values(
+        value: PrepareBasicCircuitsJob,
+    ) -> (BlockOutputWithProofs, Vec<(StorageKey, u64, StorageValue)>) {
+        let merkle_paths = value.into_merkle_paths();
+        let mut initial_read_values = Vec::new();
+        let logs = merkle_paths
+            .into_iter()
+            .map(
+                |StorageLogMetadata {
+                     root_hash,
+                     merkle_paths,
+                     is_write,
+                     first_write,
+                     leaf_enumeration_index,
+                     value_read,
+                     leaf_storage_key,
+                     ..
+                 }| {
+                    let root_hash = root_hash.into();
+                    let merkle_path = merkle_paths.into_iter().map(|x| x.into()).collect();
+                    let base: TreeLogEntry = match (is_write, first_write, leaf_enumeration_index) {
+                        (false, _, 0) => TreeLogEntry::ReadMissingKey,
+                        (false, _, _) => {
+                            initial_read_values.push((
+                                leaf_storage_key,
+                                leaf_enumeration_index,
+                                value_read.into(),
+                            ));
+                            TreeLogEntry::Read {
+                                leaf_index: leaf_enumeration_index,
+                                value: value_read.into(),
+                            }
+                        }
+                        (true, true, _) => TreeLogEntry::Inserted,
+                        (true, false, _) => {
+                            initial_read_values.push((
+                                leaf_storage_key,
+                                leaf_enumeration_index,
+                                value_read.into(),
+                            ));
+                            TreeLogEntry::Updated {
+                                leaf_index: leaf_enumeration_index,
+                                previous_value: value_read.into(),
+                            }
+                        }
+                    };
+                    TreeLogEntryWithProof {
+                        base,
+                        merkle_path,
+                        root_hash,
+                    }
+                },
+            )
+            .collect();
+
+        (
+            BlockOutputWithProofs {
+                logs,
+                leaf_count: 0,
+            },
+            initial_read_values,
+        )
     }
 
     fn execute_vm<S: WriteStorage>(
