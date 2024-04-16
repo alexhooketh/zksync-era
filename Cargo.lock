@@ -8930,8 +8930,8 @@ dependencies = [
  "multivm",
  "serde",
  "zksync_basic_types",
- "zksync_merkle_tree",
  "zksync_object_store",
+ "zksync_prover_interface",
  "zksync_types",
 ]
 

@@ -13,9 +13,8 @@ categories.workspace = true
 
 [dependencies]
 zksync_basic_types.workspace = true
-zksync_merkle_tree.workspace = true
+zksync_prover_interface.workspace = true
 zksync_object_store.workspace = true
 zksync_types.workspace = true
 multivm.workspace = true
-
 serde.workspace = true

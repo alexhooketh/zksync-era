@@ -23,7 +23,7 @@ use zksync_state::{InMemoryStorage, PostgresStorage, ReadStorage, StorageView, W
 use zksync_tee_verifier::TeeVerifierInput;
 use zksync_types::{
     block::MiniblockExecutionData, ethabi::ethereum_types::BigEndianHash, zk_evm_types::LogQuery,
-    AccountTreeId, L1BatchNumber, L2ChainId, MiniblockNumber, StorageKey, H256,
+    AccountTreeId, L1BatchNumber, L2ChainId, MiniblockNumber, StorageKey, StorageValue, H256,
 };
 use zksync_utils::{bytecode::hash_bytecode, u256_to_h256};
 
@@ -45,7 +45,7 @@ pub struct TeeVerifierInputProducer {
 #[derive(Debug)]
 pub struct TeeBlockOutputWithProofs {
     pub block_output_with_proofs: BlockOutputWithProofs,
-    pub read_keys: Vec<StorageKey>,
+    pub initial_read_values: Vec<(StorageKey, u64, StorageValue)>,
 }
 
 impl Deref for TeeBlockOutputWithProofs {
@@ -59,9 +59,8 @@ impl Deref for TeeBlockOutputWithProofs {
 impl From<PrepareBasicCircuitsJob> for TeeBlockOutputWithProofs {
     fn from(value: PrepareBasicCircuitsJob) -> Self {
         let merkle_paths = value.into_merkle_paths();
-
-        //let read_keys : Vec<Option<StorageKey>>;
-        let (read_keys, logs) = merkle_paths
+        let mut initial_read_values = Vec::new();
+        let logs = merkle_paths
             .into_iter()
             .map(
                 |StorageLogMetadata {
@@ -78,34 +77,45 @@ impl From<PrepareBasicCircuitsJob> for TeeBlockOutputWithProofs {
                     let merkle_path = merkle_paths.into_iter().map(|x| x.into()).collect();
                     let base: TreeLogEntry = match (is_write, first_write, leaf_enumeration_index) {
                         (false, _, 0) => TreeLogEntry::ReadMissingKey,
-                        (false, _, _) => TreeLogEntry::Read {
-                            leaf_index: leaf_enumeration_index,
-                            value: value_read.into(),
-                        },
+                        (false, _, _) => {
+                            initial_read_values.push((
+                                leaf_storage_key,
+                                leaf_enumeration_index,
+                                value_read.into(),
+                            ));
+                            TreeLogEntry::Read {
+                                leaf_index: leaf_enumeration_index,
+                                value: value_read.into(),
+                            }
+                        }
                         (true, true, _) => TreeLogEntry::Inserted,
-                        (true, false, _) => TreeLogEntry::Updated {
-                            leaf_index: leaf_enumeration_index,
-                            previous_value: value_read.into(),
-                        },
+                        (true, false, _) => {
+                            initial_read_values.push((
+                                leaf_storage_key,
+                                leaf_enumeration_index,
+                                value_read.into(),
+                            ));
+                            TreeLogEntry::Updated {
+                                leaf_index: leaf_enumeration_index,
+                                previous_value: value_read.into(),
+                            }
+                        }
                     };
-                    (
-                        leaf_storage_key,
-                        TreeLogEntryWithProof {
-                            base,
-                            merkle_path,
-                            root_hash,
-                        },
-                    )
+                    TreeLogEntryWithProof {
+                        base,
+                        merkle_path,
+                        root_hash,
+                    }
                 },
             )
-            .unzip();
+            .collect();
 
         TeeBlockOutputWithProofs {
             block_output_with_proofs: BlockOutputWithProofs {
                 logs,
                 leaf_count: 0,
             },
-            read_keys,
+            initial_read_values,
         }
     }
 }
@@ -131,12 +141,9 @@ impl TeeVerifierInputProducer {
         object_store: Arc<dyn ObjectStore>,
         l2_chain_id: L2ChainId,
     ) -> anyhow::Result<TeeVerifierInput> {
-        let job: PrepareBasicCircuitsJob = rt_handle
+        let prepare_basic_circuits_job: PrepareBasicCircuitsJob = rt_handle
             .block_on(object_store.get(l1_batch_number))
             .context("failed to get PrepareBasicCircuitsJob from object store")?;
-
-        let enumeration_index = job.next_enumeration_index();
-        let bowp: TeeBlockOutputWithProofs = job.into();
 
         let mut connection = rt_handle
             .block_on(connection_pool.connection())
@@ -212,26 +219,6 @@ impl TeeVerifierInputProducer {
         );
         let mut real_storage_view = StorageView::new(pg_storage);
 
-        let TeeBlockOutputWithProofs {
-            block_output_with_proofs,
-            read_keys,
-        } = bowp;
-
-        let initial_read_values = read_keys
-            .into_iter()
-            .zip(block_output_with_proofs.logs.iter())
-            .map(|(key, log)| match log.base {
-                TreeLogEntry::Updated { leaf_index, .. } => {
-                    Some((key, leaf_index, real_storage_view.read_value(&key)))
-                }
-                TreeLogEntry::Read { leaf_index, .. } => {
-                    Some((key, leaf_index, real_storage_view.read_value(&key)))
-                }
-                _ => None,
-            })
-            .flatten()
-            .collect();
-
         let used_contracts = header
             .used_contract_hashes
             .into_iter()
@@ -244,17 +231,15 @@ impl TeeVerifierInputProducer {
         info!("Started execution of l1_batch: {l1_batch_number:?}");
 
         let tee_verifier_input = TeeVerifierInput {
+            prepare_basic_circuits_job,
             l2_chain_id,
             l1_batch_number,
-            enumeration_index,
-            block_output_with_proofs,
             old_root_hash,
             new_root_hash,
             miniblocks_execution_data,
             fictive_miniblock_data,
             l1_batch_env,
             system_env,
-            initial_read_values,
             used_contracts,
         };
 
@@ -265,7 +250,7 @@ impl TeeVerifierInputProducer {
         info!("Finished execution of l1_batch: {l1_batch_number:?}");
 
         METRICS.process_batch_time.observe(started_at.elapsed());
-        debug!(
+        info!(
             "TeeVerifierInputProducer took {:?} for L1BatchNumber {}",
             started_at.elapsed(),
             l1_batch_number.0
@@ -276,19 +261,24 @@ impl TeeVerifierInputProducer {
 
     fn run_tee_verifier(tee_verifier_input: TeeVerifierInput) -> anyhow::Result<()> {
         let TeeVerifierInput {
+            prepare_basic_circuits_job,
             l2_chain_id,
             l1_batch_number,
-            enumeration_index,
-            block_output_with_proofs,
             old_root_hash,
             new_root_hash,
             miniblocks_execution_data,
             fictive_miniblock_data,
             l1_batch_env,
             system_env,
-            initial_read_values,
             used_contracts,
         } = tee_verifier_input;
+
+        let enumeration_index = prepare_basic_circuits_job.next_enumeration_index();
+
+        let TeeBlockOutputWithProofs {
+            block_output_with_proofs,
+            initial_read_values,
+        } = prepare_basic_circuits_job.into();
 
         let mut raw_storage = InMemoryStorage::with_custom_system_contracts_and_chain_id(
             l2_chain_id,
