@@ -289,6 +289,7 @@ impl TeeVerifierInputProducer {
             initial_read_values,
             used_contracts,
         } = tee_verifier_input;
+
         let mut raw_storage = InMemoryStorage::with_custom_system_contracts_and_chain_id(
             l2_chain_id,
             hash_bytecode,
@@ -308,8 +309,6 @@ impl TeeVerifierInputProducer {
                 trace!("raw_storage.set_value_enum({key:?}, {enumeration_index}, {val})");
                 raw_storage.set_value_enum(key, enumeration_index, val)
             });
-
-        // TODO enumeration_index
 
         let storage_view = Rc::new(RefCell::new(StorageView::new(&raw_storage)));
 
