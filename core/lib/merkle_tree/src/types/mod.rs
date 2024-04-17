@@ -1,6 +1,5 @@
 //! Basic storage types.
 
-use serde::{Deserialize, Serialize};
 use zksync_types::{H256, U256};
 
 pub(crate) use self::internal::{
@@ -140,7 +139,7 @@ pub struct BlockOutput {
 }
 
 /// Information about an the effect of a [`TreeInstruction`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeLogEntry {
     /// A node was inserted into the tree.
     Inserted,
@@ -181,7 +180,7 @@ impl TreeLogEntry {
 
 /// Extended output of inserting a block of entries into a Merkle tree that contains
 /// Merkle proofs for each operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct BlockOutputWithProofs {
     /// Extended information about each insertion / update operation in the order of application.
     pub logs: Vec<TreeLogEntryWithProof>,
@@ -197,7 +196,7 @@ impl BlockOutputWithProofs {
 }
 
 /// [`TreeLogEntry`] together with its authenticity proof.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct TreeLogEntryWithProof<P = Vec<ValueHash>> {
     /// Log entry about an atomic operation on the tree.
     pub base: TreeLogEntry,
