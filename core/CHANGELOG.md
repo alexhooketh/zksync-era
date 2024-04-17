@@ -1,5 +1,12 @@
 # Changelog
 
+## [23.1.0](https://github.com/matter-labs/zksync-era/compare/core-v23.0.0...core-v23.1.0) (2024-04-17)
+
+
+### Features
+
+* **en:** Add boxed L2 client and use it in DI ([#1627](https://github.com/matter-labs/zksync-era/issues/1627)) ([9948187](https://github.com/matter-labs/zksync-era/commit/9948187aa12bcd99ef512ec8cf322fefe2cd745b))
+
 ## [23.0.0](https://github.com/matter-labs/zksync-era/compare/core-v22.1.0...core-v23.0.0) (2024-04-16)
 
 
